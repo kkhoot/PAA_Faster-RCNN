@@ -1,3 +1,18 @@
+# PAA for Faster RCNN
+In this repo, you can train Faster RCNN with PAA (applied to RPN):
+```
+python tools/train_net.py \
+	--config-file configs/COCO-Detection/faster_rcnn_R_50_FPN_iou_paa_1x.yaml
+```
+Reults:
+Model | AP (minival) | AP50 | AP75 | APs | APm | APl
+--- |:---:|:---:|:---:|:---:|:---:|:---:
+Faster_R_50_FPN_1x | 37.989 | 58.810 | 41.314 | 22.361 | 41.522 | 49.584
+Faster_R_50_FPN_PAA_1x | 39.292 | 60.019 | 42.567 | 22.650 | 43.170 | 51.875
+
+## Note
+This repo is based on an old version of Detectron2, so the implementation of PAA is not compatible with the latest Detecton2.
+
 <img src=".github/Detectron2-Logo-Horz.svg" width="300" >
 
 Detectron2 is Facebook AI Research's next generation software system

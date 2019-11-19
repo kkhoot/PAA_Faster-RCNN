@@ -6,7 +6,7 @@ import torch
 from fvcore.nn import sigmoid_focal_loss_jit, smooth_l1_loss
 from torch import nn
 
-from detectron2.layers import ShapeSpec, batched_nms, cat
+from detectron2.layers import ShapeSpec, batched_nms, cat, get_norm
 from detectron2.structures import Boxes, ImageList, Instances, pairwise_iou
 from detectron2.utils.logger import log_first_n
 
@@ -370,6 +370,7 @@ class RetinaNetHead(nn.Module):
         num_convs        = cfg.MODEL.RETINANET.NUM_CONVS
         prior_prob       = cfg.MODEL.RETINANET.PRIOR_PROB
         num_anchors      = build_anchor_generator(cfg, input_shape).num_cell_anchors
+        norm             = cfg.MODEL.RETINANET.NORM
         # fmt: on
         assert (
             len(set(num_anchors)) == 1
@@ -382,10 +383,14 @@ class RetinaNetHead(nn.Module):
             cls_subnet.append(
                 nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
             )
+            if norm:
+                cls_subnet.append(get_norm(norm, in_channels))
             cls_subnet.append(nn.ReLU())
             bbox_subnet.append(
                 nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
             )
+            if norm:
+                bbox_subnet.append(get_norm(norm, in_channels))
             bbox_subnet.append(nn.ReLU())
 
         self.cls_subnet = nn.Sequential(*cls_subnet)

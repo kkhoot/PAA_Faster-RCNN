@@ -12,6 +12,7 @@ from ..box_regression import Box2BoxTransform
 from ..matcher import Matcher
 from .build import PROPOSAL_GENERATOR_REGISTRY
 from .rpn_outputs import RPNOutputs, find_top_rpn_proposals
+from ..paa import PAALossComputation
 
 RPN_HEAD_REGISTRY = Registry("RPN_HEAD")
 """
@@ -71,6 +72,10 @@ class StandardRPNHead(nn.Module):
             nn.init.normal_(l.weight, std=0.01)
             nn.init.constant_(l.bias, 0)
 
+        self.use_iou_pred = cfg.MODEL.RPN.USE_IOU_PRED
+        if self.use_iou_pred:
+            self.iou = nn.Conv2d(in_channels, num_cell_anchors, kernel_size=3, stride=1, padding=1)
+
     def forward(self, features):
         """
         Args:
@@ -78,11 +83,17 @@ class StandardRPNHead(nn.Module):
         """
         pred_objectness_logits = []
         pred_anchor_deltas = []
+        ious = []
         for x in features:
             t = F.relu(self.conv(x))
             pred_objectness_logits.append(self.objectness_logits(t))
             pred_anchor_deltas.append(self.anchor_deltas(t))
-        return pred_objectness_logits, pred_anchor_deltas
+            if self.use_iou_pred:
+                ious.append(self.iou(t))
+        res = [pred_objectness_logits, pred_anchor_deltas]
+        if self.use_iou_pred:
+            res.append(ious)
+        return res
 
 
 @PROPOSAL_GENERATOR_REGISTRY.register()
@@ -102,6 +113,7 @@ class RPN(nn.Module):
         self.positive_fraction       = cfg.MODEL.RPN.POSITIVE_FRACTION
         self.smooth_l1_beta          = cfg.MODEL.RPN.SMOOTH_L1_BETA
         self.loss_weight             = cfg.MODEL.RPN.LOSS_WEIGHT
+        self.use_iou_pred            = cfg.MODEL.RPN.USE_IOU_PRED
         # fmt: on
 
         # Map from self.training state to train/test settings
@@ -124,6 +136,11 @@ class RPN(nn.Module):
         )
         self.rpn_head = build_rpn_head(cfg, [input_shape[f] for f in self.in_features])
 
+        if cfg.MODEL.RPN.USE_PAA:
+            self.paa = PAALossComputation(cfg, self.box2box_transform)
+        else:
+            self.paa = None
+
     def forward(self, images, features, gt_instances=None):
         """
         Args:
@@ -142,7 +159,11 @@ class RPN(nn.Module):
         gt_boxes = [x.gt_boxes for x in gt_instances] if gt_instances is not None else None
         del gt_instances
         features = [features[f] for f in self.in_features]
-        pred_objectness_logits, pred_anchor_deltas = self.rpn_head(features)
+        if self.use_iou_pred:
+            pred_objectness_logits, pred_anchor_deltas, ious = self.rpn_head(features)
+        else:
+            pred_objectness_logits, pred_anchor_deltas = self.rpn_head(features)
+            ious = None
         anchors = self.anchor_generator(features)
         # TODO: The anchors only depend on the feature map shape; there's probably
         # an opportunity for some optimizations (e.g., caching anchors).
@@ -158,6 +179,8 @@ class RPN(nn.Module):
             self.boundary_threshold,
             gt_boxes,
             self.smooth_l1_beta,
+            ious,
+            self.paa
         )
 
         if self.training:

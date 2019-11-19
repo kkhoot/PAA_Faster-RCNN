@@ -232,6 +232,11 @@ _C.MODEL.RPN.POST_NMS_TOPK_TEST = 1000
 # NMS threshold used on RPN proposals
 _C.MODEL.RPN.NMS_THRESH = 0.7
 
+_C.MODEL.RPN.USE_IOU_PRED = False
+
+# Probabilistic anchor assignment.
+_C.MODEL.RPN.USE_PAA = False
+
 # ---------------------------------------------------------------------------- #
 # ROI HEADS options
 # ---------------------------------------------------------------------------- #
@@ -412,6 +417,9 @@ _C.MODEL.RETINANET.IN_FEATURES = ["p3", "p4", "p5", "p6", "p7"]
 # NOTE: this doesn't include the last conv for logits
 _C.MODEL.RETINANET.NUM_CONVS = 4
 
+# Options: GN, "SyncBN", "BN"
+_C.MODEL.RETINANET.NORM = ""
+
 # IoU overlap ratio [bg, fg] for labeling anchors.
 # Anchors with < bg are labeled negative (0)
 # Anchors  with >= bg and < fg are ignored (-1)
@@ -437,6 +445,23 @@ _C.MODEL.RETINANET.BBOX_REG_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
 _C.MODEL.RETINANET.FOCAL_LOSS_GAMMA = 2.0
 _C.MODEL.RETINANET.FOCAL_LOSS_ALPHA = 0.25
 _C.MODEL.RETINANET.SMOOTH_L1_LOSS_BETA = 0.1
+
+
+# ---------------------------------------------------------------------------- #
+# PAA Options
+# ---------------------------------------------------------------------------- #
+_C.MODEL.PAA = CN()
+
+# Focal loss parameter
+_C.MODEL.PAA.LOSS_ALPHA = 0.25
+_C.MODEL.PAA.LOSS_GAMMA = 2.0
+
+# IoU parameter to select positves
+_C.MODEL.PAA.IOU_THRESHOLDS = [0.1, 0.1]
+_C.MODEL.PAA.IOU_LABELS = [0, -1, 1]
+
+# topk for selecting candidate positive samples from each level
+_C.MODEL.PAA.TOPK = 9
 
 
 # ---------------------------------------------------------------------------- #

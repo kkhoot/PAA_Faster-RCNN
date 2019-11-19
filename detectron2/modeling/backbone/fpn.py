@@ -57,7 +57,7 @@ class FPN(Backbone):
         lateral_convs = []
         output_convs = []
 
-        use_bias = norm == ""
+        use_bias = ""
         for idx, in_channels in enumerate(in_channels):
             lateral_norm = get_norm(norm, out_channels)
             output_norm = get_norm(norm, out_channels)

@@ -157,6 +157,9 @@ def rpn_losses(
     pred_objectness_logits,
     pred_anchor_deltas,
     smooth_l1_beta,
+    gt_ious_logits=None,
+    pred_ious_logits=None,
+    loss_sum=True,
 ):
     """
     Args:
@@ -178,16 +181,32 @@ def rpn_losses(
     """
     pos_masks = gt_objectness_logits == 1
     localization_loss = smooth_l1_loss(
-        pred_anchor_deltas[pos_masks], gt_anchor_deltas[pos_masks], smooth_l1_beta, reduction="sum"
+        pred_anchor_deltas[pos_masks], gt_anchor_deltas[pos_masks], smooth_l1_beta, reduction="none"
     )
 
     valid_masks = gt_objectness_logits >= 0
     objectness_loss = F.binary_cross_entropy_with_logits(
         pred_objectness_logits[valid_masks],
         gt_objectness_logits[valid_masks].to(torch.float32),
-        reduction="sum",
+        reduction="none",
     )
-    return objectness_loss, localization_loss
+
+    if gt_ious_logits is not None and pred_ious_logits is not None:
+        ious_loss = F.binary_cross_entropy_with_logits(
+            pred_ious_logits[pos_masks],
+            gt_ious_logits[pos_masks].to(torch.float32),
+            reduction="none",
+        )
+        localization_loss *= gt_ious_logits[pos_masks].view(-1, 1)
+    else:
+        ious_loss = None
+
+    if loss_sum:
+        objectness_loss = objectness_loss.sum()
+        localization_loss = localization_loss.sum()
+        ious_loss = ious_loss.sum() if ious_loss is not None else None
+
+    return objectness_loss, localization_loss, ious_loss
 
 
 class RPNOutputs(object):
@@ -204,6 +223,8 @@ class RPNOutputs(object):
         boundary_threshold=0,
         gt_boxes=None,
         smooth_l1_beta=0.0,
+        ious=None,
+        paa=None,
     ):
         """
         Args:
@@ -237,6 +258,7 @@ class RPNOutputs(object):
         self.batch_size_per_image = batch_size_per_image
         self.positive_fraction = positive_fraction
         self.pred_objectness_logits = pred_objectness_logits
+        self.ious = ious
         self.pred_anchor_deltas = pred_anchor_deltas
 
         self.anchors = anchors
@@ -246,6 +268,7 @@ class RPNOutputs(object):
         self.image_sizes = images.image_sizes
         self.boundary_threshold = boundary_threshold
         self.smooth_l1_beta = smooth_l1_beta
+        self.paa = paa
 
     def _get_ground_truth(self):
         """
@@ -257,9 +280,12 @@ class RPNOutputs(object):
         """
         gt_objectness_logits = []
         gt_anchor_deltas = []
+        matched_gt_boxes = []
+        matched_idx_all = []
         # Concatenate anchors from all feature maps into a single Boxes per image
         anchors = [Boxes.cat(anchors_i) for anchors_i in self.anchors]
-        for image_size_i, anchors_i, gt_boxes_i in zip(self.image_sizes, anchors, self.gt_boxes):
+        for image_i, (image_size_i, anchors_i, gt_boxes_i) in enumerate(
+                zip(self.image_sizes, anchors, self.gt_boxes)):
             """
             image_size_i: (h, w) for the i-th image
             anchors_i: anchors for i-th image
@@ -269,6 +295,7 @@ class RPNOutputs(object):
             matched_idxs, gt_objectness_logits_i = retry_if_cuda_oom(self.anchor_matcher)(
                 match_quality_matrix
             )
+            matched_idx_all.append(matched_idxs)
             # Matching is memory-expensive and may result in CPU tensors. But the result is small
             gt_objectness_logits_i = gt_objectness_logits_i.to(device=gt_boxes_i.device)
             del match_quality_matrix
@@ -282,19 +309,72 @@ class RPNOutputs(object):
             if len(gt_boxes_i) == 0:
                 # These values won't be used anyway since the anchor is labeled as background
                 gt_anchor_deltas_i = torch.zeros_like(anchors_i.tensor)
+                matched_gt_boxes_i = torch.zeros_like(anchors_i.tensor)
             else:
                 # TODO wasted computation for ignored boxes
-                matched_gt_boxes = gt_boxes_i[matched_idxs]
+                matched_gt_boxes_i = gt_boxes_i[matched_idxs]
                 gt_anchor_deltas_i = self.box2box_transform.get_deltas(
-                    anchors_i.tensor, matched_gt_boxes.tensor
+                    anchors_i.tensor, matched_gt_boxes_i.tensor
                 )
 
             gt_objectness_logits.append(gt_objectness_logits_i)
             gt_anchor_deltas.append(gt_anchor_deltas_i)
+            matched_gt_boxes.append(matched_gt_boxes_i)
 
-        return gt_objectness_logits, gt_anchor_deltas
+        if self.paa:
+            with torch.no_grad():
+                temp_ious = self.ious
+                self.ious = None
+                losses = self.losses(use_resample=False,
+                                     loss_sum=False,
+                                     gt_objectness_logits=gt_objectness_logits,
+                                     gt_anchor_deltas=gt_anchor_deltas,
+                                     matched_gt_boxes=matched_gt_boxes)
+                self.ious = temp_ious
 
-    def losses(self):
+                N = len(gt_objectness_logits)
+                gt_objectness_logits = torch.cat(gt_objectness_logits).view(N, -1)
+
+                # code to reshape losses (L x N x H x W x A) to
+                # (N x L x H x W x A) to align with gts and anchors
+                num_anchors_per_map = [len(anchors_per_level) for anchors_per_level in self.anchors[0]]
+                gt_objectness_logits_tmp = torch.split(gt_objectness_logits, num_anchors_per_map, dim=1)
+                gt_objectness_logits_tmp = cat([x.flatten() for x in gt_objectness_logits_tmp], dim=0)
+                pos_idx = gt_objectness_logits_tmp == 1
+                ignore_idx = gt_objectness_logits_tmp == -1
+                if ignore_idx.sum().item() > 0:
+                    print("For PAA, anchors with ignore label are turned into negatives")
+                    gt_objectness_logits_tmp[ignore_idx] = 0
+                loc_loss = losses["loss_rpn_loc"].sum(1)
+                loc_loss_full = torch.full((gt_objectness_logits_tmp.numel(),),
+                                           float('inf')).to(device=pos_idx.device)
+                loc_loss_full[pos_idx] = loc_loss
+
+                num_anchors_per_map_N = [len(anchors_per_level) * N for anchors_per_level in self.anchors[0]]
+                cls_loss = torch.split(losses["loss_rpn_cls"], num_anchors_per_map_N, dim=0)
+                cls_loss = torch.cat([cl.view(N, -1) for cl in cls_loss], dim=1)
+                loc_loss_full = torch.split(loc_loss_full, num_anchors_per_map_N, dim=0)
+                loc_loss_full = torch.cat([ll.view(N, -1) for ll in loc_loss_full], dim=1)
+                # end of code to reshape/align losses with gts/anchors
+
+                combined_loss = cls_loss + loc_loss_full
+                gt_box_labels = [torch.full((gt_boxes_i.tensor.shape[0],), 1).to(
+                    torch.long) for gt_boxes_i in self.gt_boxes]
+                (gt_objectness_logits,
+                 gt_anchor_deltas,
+                 matched_gt_boxes) = self.paa.compute_paa(self.gt_boxes,
+                                                          gt_box_labels,
+                                                          self.anchors,
+                                                          gt_objectness_logits,
+                                                          combined_loss,
+                                                          matched_idx_all)
+                matched_gt_boxes = [Boxes(gt_boxes_i) for gt_boxes_i in matched_gt_boxes]
+
+        return gt_objectness_logits, gt_anchor_deltas, matched_gt_boxes
+
+    def losses(self, use_resample=True, loss_sum=True,
+               gt_objectness_logits=None, gt_anchor_deltas=None,
+               matched_gt_boxes=None, log=True):
         """
         Return the losses from a set of RPN predictions and their associated ground-truth.
 
@@ -319,7 +399,8 @@ class RPNOutputs(object):
             label.scatter_(0, neg_idx, 0)
             return label
 
-        gt_objectness_logits, gt_anchor_deltas = self._get_ground_truth()
+        if any(gt is None for gt in (gt_objectness_logits, gt_anchor_deltas, matched_gt_boxes)):
+            gt_objectness_logits, gt_anchor_deltas, matched_gt_boxes = self._get_ground_truth()
         """
         gt_objectness_logits: list of N tensors. Tensor i is a vector whose length is the
             total number of anchors in image i (i.e., len(anchors[i]))
@@ -332,16 +413,23 @@ class RPNOutputs(object):
         num_anchors_per_image = sum(num_anchors_per_map)
 
         # Stack to: (N, num_anchors_per_image)
-        gt_objectness_logits = torch.stack(
-            [resample(label) for label in gt_objectness_logits], dim=0
-        )
+        if use_resample:
+            gt_objectness_logits = torch.stack(
+                [resample(label) for label in gt_objectness_logits], dim=0
+            )
+        else:
+            gt_objectness_logits = torch.stack(
+                [label for label in gt_objectness_logits], dim=0
+            )
 
-        # Log the number of positive/negative anchors per-image that's used in training
-        num_pos_anchors = (gt_objectness_logits == 1).sum().item()
-        num_neg_anchors = (gt_objectness_logits == 0).sum().item()
-        storage = get_event_storage()
-        storage.put_scalar("rpn/num_pos_anchors", num_pos_anchors / self.num_images)
-        storage.put_scalar("rpn/num_neg_anchors", num_neg_anchors / self.num_images)
+
+        if log:
+            # Log the number of positive/negative anchors per-image that's used in training
+            num_pos_anchors = (gt_objectness_logits == 1).sum().item()
+            num_neg_anchors = (gt_objectness_logits == 0).sum().item()
+            storage = get_event_storage()
+            storage.put_scalar("rpn/num_pos_anchors", num_pos_anchors / self.num_images)
+            storage.put_scalar("rpn/num_neg_anchors", num_neg_anchors / self.num_images)
 
         assert gt_objectness_logits.shape[1] == num_anchors_per_image
         # Split to tuple of L tensors, each with shape (N, num_anchors_per_map)
@@ -358,6 +446,12 @@ class RPNOutputs(object):
         gt_anchor_deltas = torch.split(gt_anchor_deltas, num_anchors_per_map, dim=1)
         # Concat from all feature maps
         gt_anchor_deltas = cat([x.reshape(-1, B) for x in gt_anchor_deltas], dim=0)
+
+        matched_gt_boxes = torch.stack([x.tensor for x in matched_gt_boxes], dim=0)
+        # Split to tuple of L tensors, each with shape (N, num_anchors_per_map)
+        matched_gt_boxes = torch.split(matched_gt_boxes, num_anchors_per_map, dim=1)
+        # Concat from all feature maps
+        matched_gt_boxes = cat([x.reshape(-1, B) for x in matched_gt_boxes], dim=0)
 
         # Collect all objectness logits and delta predictions over feature maps
         # and images to arrive at the same shape as the labels and targets
@@ -381,19 +475,52 @@ class RPNOutputs(object):
             ],
             dim=0,
         )
+        if self.ious is not None:
+            pred_ious_logits = cat(
+                [
+                    # Reshape: (N, A, Hi, Wi) -> (N, Hi, Wi, A) -> (N*Hi*Wi*A, )
+                    x.permute(0, 2, 3, 1).flatten()
+                    for x in self.ious
+                ],
+                dim=0,
+            )
+            pred_boxes = torch.cat([x.reshape(-1, B)
+                for x in self.predict_proposals()], dim=0).detach()
+            area1 = (matched_gt_boxes[:, 2] - matched_gt_boxes[:, 0] + 1) * (
+                     matched_gt_boxes[:, 3] - matched_gt_boxes[:, 1] + 1)
+            area2 = (pred_boxes[:, 2] - pred_boxes[:, 0] + 1) * (
+                     pred_boxes[:, 3] - pred_boxes[:, 1] + 1)
+            lt = torch.max(matched_gt_boxes[:, :2], pred_boxes[:, :2])
+            rb = torch.min(matched_gt_boxes[:, 2:], pred_boxes[:, 2:])
+            wh = (rb - lt + 1).clamp(min=0)
+            inter = wh[:, 0] * wh[:, 1]
+            gt_ious_logits = inter / (area1 + area2 - inter)
 
-        objectness_loss, localization_loss = rpn_losses(
+        else:
+            pred_ious_logits = gt_ious_logits = None
+
+        loss = rpn_losses(
             gt_objectness_logits,
             gt_anchor_deltas,
             pred_objectness_logits,
             pred_anchor_deltas,
             self.smooth_l1_beta,
+            gt_ious_logits,
+            pred_ious_logits,
+            loss_sum,
         )
+        objectness_loss, localization_loss = loss[:2]
         normalizer = 1.0 / (self.batch_size_per_image * self.num_images)
-        loss_cls = objectness_loss * normalizer  # cls: classification loss
-        loss_loc = localization_loss * normalizer  # loc: localization loss
-        losses = {"loss_rpn_cls": loss_cls, "loss_rpn_loc": loss_loc}
-
+        loss_cls = objectness_loss
+        losses = {"loss_rpn_cls": loss_cls, "loss_rpn_loc": localization_loss}
+        if self.ious is not None:
+            losses["loss_rpn_iou"] = loss[2]
+        if loss_sum:
+            losses["loss_rpn_cls"] = losses["loss_rpn_cls"].sum() * normalizer
+            losses["loss_rpn_loc"] = losses["loss_rpn_loc"].sum() * normalizer
+            if self.ious is not None:
+                num_pos = (gt_objectness_logits == 1).sum().item()
+                losses["loss_rpn_iou"] = losses["loss_rpn_iou"].sum() / max(num_pos, 1.0)
         return losses
 
     def predict_proposals(self):
@@ -439,4 +566,18 @@ class RPNOutputs(object):
             score.permute(0, 2, 3, 1).reshape(self.num_images, -1)
             for score in self.pred_objectness_logits
         ]
-        return pred_objectness_logits
+        if self.ious is not None:
+            pred_ious_logits = [
+                # Reshape: (N, A, Hi, Wi) -> (N, Hi, Wi, A) -> (N, Hi*Wi*A)
+                iou.permute(0, 2, 3, 1).reshape(self.num_images, -1)
+                for iou in self.ious
+            ]
+            pred_objectness_iou_logits = []
+            for p1, p2 in zip(pred_objectness_logits, pred_ious_logits):
+                # apply (objectness prob * iou score) ** 0.05 to normalize
+                p = (p1.sigmoid()*p2.sigmoid()).sqrt()
+                # apply inverse sigmoid to turn probs into logits
+                pred_objectness_iou_logits.append((p/(1-p)).log())
+            return pred_objectness_iou_logits
+        else:
+            return pred_objectness_logits
